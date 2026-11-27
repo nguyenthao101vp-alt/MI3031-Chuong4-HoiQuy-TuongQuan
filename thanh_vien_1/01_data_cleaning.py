@@ -1,58 +1,80 @@
+# -*- coding: utf-8 -*-
+"""01_data_cleaning.py - Làm sạch dữ liệu CTG (CafeF) và xuất data/data_clean.csv dùng chung.
+Chạy từ thư mục gốc của dự án:  python code/01_data_cleaning.py
 """
-TV1 - Mục 1 & 2: Làm sạch dữ liệu gốc và tạo tập biến dùng chung cho cả 2 mô hình.
-Đầu vào : data/raw/raw_stock_data.csv (cập nhật đúng tên file dữ liệu gốc của nhóm)
-Đầu ra  : data/clean/data_clean.csv
-"""
-
-from pathlib import Path
+import os
+import numpy as np
 import pandas as pd
 
-RAW_PATH = Path("data/raw/raw_stock_data.csv")
-CLEAN_PATH = Path("data/clean/data_clean.csv")
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import glob
+files = glob.glob(os.path.join(BASE, "data", "*.xlsx"))
+print("File Excel tìm thấy:", files)
+RAW = files[0]
+OUT = os.path.join(BASE, "data", "data_clean.csv")
 
+# ---- 1. Đọc dữ liệu gốc -------------------------------------------------
+raw = pd.read_excel(RAW)
+print("Kích thước dữ liệu gốc:", raw.shape)
+print(raw.dtypes, "\n")
 
-def clean_and_prepare_data(raw_path: Path, clean_path: Path) -> pd.DataFrame:
-    if not raw_path.exists():
-        raise FileNotFoundError(
-            f"Chưa tìm thấy file dữ liệu gốc tại: {raw_path}. "
-            "Hãy đặt file CSV gốc vào thư mục data/raw/ và cập nhật tên cột tương ứng."
-        )
+# ---- 2. Kiểm tra khuyết / trùng ----------------------------------------
+print("Số giá trị khuyết theo cột:\n", raw.isna().sum(), "\n")
+print("Số dòng trùng lặp hoàn toàn:", raw.duplicated().sum())
+print("Số ngày giao dịch trùng:", raw["Ngày"].duplicated().sum())
+df = raw.drop_duplicates().dropna().copy()
 
-    df = pd.read_csv(raw_path)
+# ---- 3. Chuẩn hóa kiểu dữ liệu & sắp xếp tăng dần theo thời gian ------
+df["Ngay"] = pd.to_datetime(df["Ngày"], format="%d/%m/%Y")
+df = df.sort_values("Ngay").reset_index(drop=True)
 
-    # TODO: Cập nhật tên cột cho khớp với file dữ liệu gốc của nhóm
-    # Giả định các cột gốc: ['Date', 'Open', 'Close', 'Volume']
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").drop_duplicates(subset=["Date"]).reset_index(drop=True)
+# Tách cột "Thay đổi" dạng "+0,80 (+2,68%)" thành số tuyệt đối & phần trăm
+pat = r"^\s*([+-]?[\d,\.]+)\s*\(\s*([+-]?[\d,\.]+)\s*%\s*\)\s*$"
+ext = df["Thay đổi"].astype(str).str.extract(pat)
+df["Thay_doi"] = ext[0].str.replace(",", ".", regex=False).astype(float)      # nghìn đồng
+df["Thay_doi_pct"] = ext[1].str.replace(",", ".", regex=False).astype(float)  # %
+assert df["Thay_doi"].notna().all(), "Có dòng 'Thay đổi' không tách được"
 
-    # Xử lý giá trị khuyết cơ bản
-    df = df.dropna(subset=["Open", "Close", "Volume"]).copy()
+df = df.rename(columns={"Giá đóng cửa": "Gia_dong_cua", "Giá mở cửa": "Gia_mo_cua",
+                        "Khối lượng khớp lệnh": "Khoi_luong",
+                        "Giá cao nhất": "Gia_cao_nhat", "Giá thấp nhất": "Gia_thap_nhat"})
 
-    # Tạo biến cho mô hình hồi quy đơn & hồi quy bội:
-    # Y  : Giá đóng cửa cùng phiên
-    # x1 : Giá mở cửa cùng phiên (cũng là biến x của hồi quy đơn)
-    # x2 : Khối lượng phiên trước đó (lag 1)
-    # x3 : Thay đổi so với phiên trước (ví dụ: Open_t - Close_{t-1} hoặc Close_{t-1} - Close_{t-2} để tránh rò rỉ từ Y_t)
-    # x4 : Thời điểm tại phiên giao dịch (chỉ số thứ tự phiên t = 1, 2, ..., n)
-    df["Y_close"] = df["Close"].astype(float)
-    df["x1_open"] = df["Open"].astype(float)
-    df["x2_prev_volume"] = df["Volume"].shift(1).astype(float)
-    df["x3_prev_change"] = (df["Close"].shift(1) - df["Close"].shift(2)).astype(float)
+# Kiểm tra nhất quán: Thay đổi = Giá đóng cửa(t) - Giá đóng cửa(t-1)
+chk = (df["Thay_doi"] - df["Gia_dong_cua"].diff()).abs()
+print("Sai lệch lớn nhất giữa 'Thay đổi' và chênh lệch giá đóng cửa (từ dòng 2):", chk.iloc[1:].max())
+print("Thay đổi ở phiên đầu tiên (mép dữ liệu, không có phiên trước):", df.loc[0, "Thay_doi"])
 
-    # Loại bỏ các dòng đầu bị NaN do phép dịch trễ
-    df_clean = df.dropna(subset=["x2_prev_volume", "x3_prev_change"]).reset_index(drop=True)
-    df_clean["x4_time_index"] = range(1, len(df_clean) + 1)
+# Kiểm tra logic giá (Low <= Open, Close <= High)
+bad = df[(df.Gia_thap_nhat > df[["Gia_mo_cua", "Gia_dong_cua"]].min(axis=1)) |
+         (df.Gia_cao_nhat < df[["Gia_mo_cua", "Gia_dong_cua"]].max(axis=1))]
+print("Số dòng vi phạm quan hệ Low <= Open,Close <= High:", len(bad))
 
-    cols_out = ["Date", "Y_close", "x1_open", "x2_prev_volume", "x3_prev_change", "x4_time_index"]
-    df_clean = df_clean[cols_out]
+# Kiểm tra ngoại lai sơ bộ bằng quy tắc 1,5*IQR
+for c in ["Gia_dong_cua", "Gia_mo_cua", "Khoi_luong"]:
+    q1, q3 = df[c].quantile([.25, .75]); iqr = q3 - q1
+    n_out = ((df[c] < q1 - 1.5 * iqr) | (df[c] > q3 + 1.5 * iqr)).sum()
+    print(f"Ngoại lai (1,5*IQR) của {c}: {n_out}")
 
-    clean_path.parent.mkdir(parents=True, exist_ok=True)
-    df_clean.to_csv(clean_path, index=False)
+# ---- 4. Tạo bộ biến cho hai mô hình ------------------------------------
+df["Y"] = df["Gia_dong_cua"]                            # Y: giá đóng cửa cùng phiên
+df["x"] = df["Gia_mo_cua"]                              # x = x1: giá mở cửa cùng phiên
+df["x2"] = df["Khoi_luong"].shift(1)                    # x2: khối lượng phiên trước (lag 1)
+# x3: thay đổi giá của phiên liền trước (lag 1) -> không chứa Y_t, tránh rò rỉ dữ liệu.
+df["x3"] = df["Thay_doi"].shift(1)
+df["x3_pct"] = df["Thay_doi_pct"].shift(1)
 
-    print(f"Đã xuất dữ liệu sạch: {clean_path} (n = {len(df_clean)} quan sát)")
-    print(df_clean.describe().round(4))
-    return df_clean
+# ---- 5. Chốt tập dữ liệu sạch ------------------------------------------
+# Loại: (i) dòng đầu do lag x2 bị NaN;
+#       (ii) dòng thứ hai vì x3 lấy từ 'Thay đổi' của phiên đầu = 0,00 (giá trị mép dữ liệu,
+#            không phản ánh biến động thật vì không có phiên trước đó).
+clean = df.iloc[2:].copy().reset_index(drop=True)
+clean["x4"] = np.arange(1, len(clean) + 1)              # x4: thứ tự phiên 1..n trong mẫu sạch
+clean["x1"] = clean["x"]
+cols = ["Ngay", "x4", "Y", "x", "x1", "x2", "x3", "x3_pct",
+        "Gia_cao_nhat", "Gia_thap_nhat", "Khoi_luong", "Thay_doi", "Thay_doi_pct"]
+clean = clean[cols]
+assert clean[["Y", "x", "x1", "x2", "x3", "x4"]].isna().sum().sum() == 0
 
-
-if __name__ == "__main__":
-    clean_and_prepare_data(RAW_PATH, CLEAN_PATH)
+clean.to_csv(OUT, index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+print(f"\nĐã xuất {OUT}: n = {len(clean)} quan sát, từ {clean.Ngay.min().date()} đến {clean.Ngay.max().date()}")
+print(clean.describe().T[["mean", "std", "min", "max"]].round(4))
